@@ -1,3 +1,16 @@
+#' Clean Flowlines Target
+#' 
+#' @description
+#' Processes flowlines according to step 4.3.2
+#' 
+#' @param flowlines_path Path to NHD flowlines file
+#' @param rf_cat_paths Path to _reference_ catchment outputs
+#' @param rf_ble_path Path to CONUS burn line events file
+#' @param rf_vaa NHDPlus-VAA table
+#' @param rf_enhd E2NHDPlus River Attributes table
+#' @param dir_cleaned Cleaned output directory
+#' @returns Path to cleaned flowlines
+#' 
 #' @export
 rf.targets.clean_flowlines <- function(flowlines_path, rf_cat_paths, rf_ble_path, rf_vaa, rf_enhd, dir_cleaned) {
   nhd <-
@@ -28,20 +41,25 @@ rf.targets.clean_flowlines <- function(flowlines_path, rf_cat_paths, rf_ble_path
 
   rm(rf_cat_paths)
 
+  # Here we begin checking if a flowline's starting node lies in a catchemnt
+  # other than the one it is associated with. If it is, we replace its geometry
+  # with the BLE geometry (reducing the effective length by 150m).
+
   ble_comid <- sf::read_sf(rf_ble_path, query = "SELECT COMID FROM burnline_events")$COMID
-
-  rm(rf_ble_path)
-
+  
+  # Get the flowlines with a matching burn line event
   ble_options <-
     dplyr::filter(nhd, COMID %in% ble_comid) |>
     sf::st_transform(5070)
 
   rm(ble_comid)
-
+  
+  ## Convert matching flowlines' geometry to their starting node
   sf::st_geometry(ble_options) <-
     nhdplusTools::get_node(ble_options, "start") |>
     sf::st_geometry()
-
+  
+  # Check starting node
   imap <- sf::st_intersects(ble_options, cats)
 
   df <- data.frame(
@@ -54,11 +72,21 @@ rf.targets.clean_flowlines <- function(flowlines_path, rf_cat_paths, rf_ble_path
   rm(ble_options)
   rm(imap)
 
-  ble <- dplyr::filter(nhd, COMID %in% df$start)
-  .matches <- match(df$start, nhd$COMID)
+  # Get corresponding burn line geometries
+  ble <- sf::read_sf(rf_ble_path, query = paste0(
+    "SELECT COMID, '_ogr_geometry_' AS geometry FROM burnline_events WHERE vpuid = '", rf.utils.extract_vpu(flowlines_path), "'"
+  )) |>
+    dplyr::filter(COMID %in% df$start) |>
+    dplyr::distinct(COMID, .keep_all = TRUE) |>
+    sf::st_as_sf() |>
+    sf::st_transform(5070)
+
+  # Indices for which burnline matches what flowline
+  .matches <- match(ble$COMID, nhd$COMID)
 
   rm(df)
 
+  # This is where we replace the geometry
   sf::st_geometry(nhd)[.matches] <- sf::st_geometry(ble)
   nhd$ble <- FALSE
   nhd$ble[.matches] <- TRUE
@@ -82,8 +110,17 @@ rf.targets.clean_flowlines <- function(flowlines_path, rf_cat_paths, rf_ble_path
   outfile
 }
 
-# FIXME !!!
-
+#' Reference Flowlines Target
+#' 
+#' @description
+#' Processes flowlines according to step 4.3.3
+#' 
+#' @param nhd Path to _cleaned_ flowlines
+#' @param vpu Current VPU for `nhd`.
+#' @param rf_enhd_comid COMIDs with E2NHDPlus river attributes
+#' @param dir_reference Reference output directory
+#' @returns Path to reference flowlines
+#' 
 #' @export
 rf.targets.reference_flowlines <- function(nhd, vpu, rf_enhd_comid, dir_reference) {
   nhd <- sf::read_sf(nhd)

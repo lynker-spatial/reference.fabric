@@ -1,3 +1,10 @@
+#' Copies NHD files with `vpu` to `new_dir`.
+#'
+#' @param vpu VPU identifier
+#' @param files List of files to scan
+#' @param new_dir Directory to copy matching files into
+#' @returns Path(s) of copied file(s)
+#'
 #' @keywords internal
 rf.helper.copy_file <- function(vpu, files, new_dir) {
   f <- grep(vpu, files)
@@ -34,14 +41,25 @@ rf.targets.catchment_info <- function(vpu_topology, catchments_paths, flowlines_
     dplyr::rowwise()
 }
 
+#' Clean Catchments Target
+#' 
+#' @description
+#' Processes catchments according to steps 4.2.1 - 4.2.3.
+#' 
+#' @param cat_info `data.frame` containing path information for catchments and flowlines
+#' @param simplify_keep Tolerance value for weighted Visvalingam simplification
+#' @returns Path to cleaned catchment output (`cat_info$outfile`).
+#' 
 #' @export
 rf.targets.clean_catchment <- function(cat_info, simplify_keep = 0.20) {
 
+  # Transform catchments to Conus Albers
   catchment <-
     sf::read_sf(cat_info$cat_path) |>
     sf::st_transform(5070)
   names(catchment) <- tolower(names(catchment))
 
+  # Transform flowlines to Conus Albers
   flowlines <-
     sf::read_sf(cat_info$fl_path) |>
     sf::st_transform(5070)
@@ -55,6 +73,9 @@ rf.targets.clean_catchment <- function(cat_info, simplify_keep = 0.20) {
   options(ms_tempdir = new_tmpdir)
   on.exit(unlink(new_tmpdir, recursive = TRUE, force = TRUE))
 
+  # Clean fragments in catchments. This function handles
+  # fragments and topology-preserving simplification,
+  # as described in steps 4.2.1 - 4.2.3.
   out <- hydrofab::clean_geometry(
     catchments = catchment,
     flowlines = flowlines,
@@ -70,11 +91,26 @@ rf.targets.clean_catchment <- function(cat_info, simplify_keep = 0.20) {
     options(ms_tempdir = old_tmpdir)
   }
 
+  # Output cleaned catchments
   rf.utils.ensure_directory(dirname(cat_info$outfile))
   sf::st_write(out, cat_info$outfile, layer = "catchments", quiet = TRUE, delete_dsn = TRUE)
   cat_info$outfile
 }
 
+#' Catchment VPU Rectification Target
+#' 
+#' @description
+#' Processes VPU rectification of _cleaned_ catchments according to step 4.2.4.
+#' 
+#' @note
+#' This process is highly data-dependent, so we must process it sequentially.
+#' 
+#' @param cat_cleaned_paths Paths to cleaned catchment files
+#' @param vpu_topology `data.frame` containing topology definition for VPUs
+#' @param dir_reference Output directory for reference features
+#' 
+#' @returns List of catchment output paths
+#' 
 #' @export
 rf.targets.rectify_catchment_borders <- function(cat_cleaned_paths, vpu_topology, dir_reference) {
   already_processed <- list.files(dir_reference, pattern = "catchments\\.fgb", recursive = TRUE, full.names = TRUE)
@@ -86,16 +122,21 @@ rf.targets.rectify_catchment_borders <- function(cat_cleaned_paths, vpu_topology
   rf.utils.ensure_directory(tmpdir)
   on.exit(unlink(tmpdir, recursive = TRUE, force = TRUE))
 
+  # For each row of the VPU topology, we read in the catchments
+  # corresponding to VPU A and VPU B. Then, we process them along
+  # the boundary, and write the catchments back to their corresponding
+  # output file.
   for (i in seq_len(nrow(vpu_topology))) {
-    VPU1 <- vpu_topology$VPU1[i]
-    VPU2 <- vpu_topology$VPU2[i]
+    VPU1 <- vpu_topology$VPU1[i] # A
+    VPU2 <- vpu_topology$VPU2[i] # B
 
     v_path_1 <-
       rf.helper.copy_file(VPU1, cat_cleaned_paths, dir_reference)
     v_path_2 <-
       rf.helper.copy_file(VPU2, cat_cleaned_paths, dir_reference)
 
-
+    # Read in catchments for VPU A/B. We transform to 4326 to ensure
+    # consistency with mapshaper. (Otherwise, it complains about planar SRS).
     vpu_div_1 <-
       sf::read_sf(v_path_1, "catchments") |>
       dplyr::mutate(vpuid = VPU1) |>
@@ -106,13 +147,14 @@ rf.targets.rectify_catchment_borders <- function(cat_cleaned_paths, vpu_topology
       dplyr::mutate(vpuid = VPU2) |>
       sf::st_transform(4326)
 
+    # Join VPU A and VPU B into a single file for mapshaper to clean
     tmpfile <- tempfile(pattern = "rectify_borders", tmpdir = tmpdir, fileext = ".geojson")
-
     dplyr::bind_rows(vpu_div_1, vpu_div_2) |>
       yyjsonr::write_geojson_file(tmpfile)
 
     system2("mapshaper", args = c(tmpfile, "-clean", "-o", "force", tmpfile))
 
+    # Read in cleaned catchment files and ensure area is consistent
     new <-
       yyjsonr::read_geojson_file(tmpfile) |>
       sf::st_as_sf() |>
@@ -123,11 +165,11 @@ rf.targets.rectify_catchment_borders <- function(cat_cleaned_paths, vpu_topology
 
     unlink(tmpfile)
 
-    # to_keep_1
+    # separate and write back VPU A
     dplyr::filter(new, vpuid == VPU1) |>
       sf::st_write(v_path_1, "catchments", delete_dsn = TRUE, quiet = TRUE)
 
-    # to_keep_2
+    # separate and write back VPU B
     dplyr::filter(new, vpuid == VPU2) |>
         sf::st_write(v_path_2, "catchments", delete_dsn = TRUE, quiet = TRUE)
   }
@@ -135,10 +177,22 @@ rf.targets.rectify_catchment_borders <- function(cat_cleaned_paths, vpu_topology
   list.files(dir_reference, pattern = "catchments\\.fgb", recursive = TRUE, full.names = TRUE)
 }
 
+#' Catchments Reference Output Target
+#' 
+#' @description
+#' Processes remaining catchment steps according to step 4.2.5.
+#' 
+#' @param rf_cat_path Path to VPU-rectified catchment
+#' @returns Path to outputted reference catchment
+#' 
+#' @section FIXME: Snap to underlying grid with size of .0009?
+#' 
 #' @export
 rf.targets.reference_catchments <- function(rf_cat_path) {
 
   cats <- sf::read_sf(rf_cat_path)
+
+  # Handle catchments fully within other catchments
   imap <- sf::st_within(cats)
 
   df <- data.frame(
@@ -152,7 +206,7 @@ rf.targets.reference_catchments <- function(rf_cat_path) {
   cats2 <- dplyr::filter(cats, !featureid %in% unlist(df))
 
   if (nrow(df) > 0) {
-
+    # For each consuming catchment, combined the contained catchments and erase.
     d <- lapply(unique(df$featureid), FUN = function(id) {
       dplyr::filter(cats, featureid %in% dplyr::filter(df, featureid == id)$within) |>
         sf::st_combine() |>
@@ -167,6 +221,7 @@ rf.targets.reference_catchments <- function(rf_cat_path) {
     rm(d)
   }
 
+  # Combine differenced catchments, recalc area, and output to disk
   dplyr::filter(
     cats,
     featureid %in% dplyr::filter(df, !within %in% cats2$featureid)$within
